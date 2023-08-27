@@ -1,0 +1,142 @@
+name: DeployAzureFunction
+variables:
+  FunctionAppName: 'ffffat'
+  AzureConnection: 'MPN'
+  ResourcegGroupName: 'RG_ffffa'
+
+trigger:
+  branches:
+    include:
+    - '*'  # must quote since "*" is a YAML reserved character; we want a string
+
+
+
+stages:
+
+- stage: Build
+  jobs:
+  - job: Test_FA
+    pool:
+      vmImage: windows-latest
+    steps:
+    - task: AzureResourceGroupDeployment@2
+      displayName: 'Test ARM Deployment'
+      inputs:
+        azureSubscription: $(AzureConnection)
+        resourceGroupName: $(ResourcegGroupName)
+        location: 'west Europe'
+        csmFile: Deployment/azuredeploy.json
+        deploymentMode: Validation
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: 'Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser'
+        pwsh: true
+      displayName: 'Install PSScriptAnalyser'
+    # - powershell: |
+    #     Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+    # #   displayName: 'Install Pester and import module'
+    # - task: Pester@10
+    #   inputs:
+    #     scriptFolder: '$(System.DefaultWorkingDirectory)\*'
+    #     resultsFile: '$(System.DefaultWorkingDirectory)\Test-Pester.XML'
+    #     usePSCore: true
+    - task: Pester@9
+      displayName: 'Invoke-Pester'
+      inputs:
+        scriptFolder: '$(System.DefaultWorkingDirectory)\*'
+        resultsFile: '$(System.DefaultWorkingDirectory)\TEST-RESULTS.XML'
+        usePSCore: true
+        PesterVersion: 'OtherVersion'
+        preferredPesterVersion: '4.9.0'
+      continueOnError: true
+    
+    - task: PublishTestResults@2
+      condition: always()
+      displayName: 'Publish Test Results'
+      inputs:
+        testRunTitle: "Pester Results"
+        buildPlatform: Windows
+        testRunner: 'NUnit'
+        testResultsFiles: './TEST-RESULTS.xml'
+        failTaskOnFailedTests: true
+    
+    # - powershell: |
+    #     $outputFile = ".\TEST-RESULTS.xml"
+
+    #     Invoke-Pester -OutputFile $outputFile -OutputFormat NUnitXml -enableExit
+    #   failOnStderr: false
+    #   displayName: 'Invoke-Pester'
+
+    # - task: PublishTestResults@2
+    #   displayName: Publish Test Results
+    #   inputs:
+    #     testRunTitle: 'Test Results for Pester'
+    #     buildPlatform: 'Windows'
+    #     testRunner: 'NUnit'
+    #     testResultsFiles: './TEST-RESULTS.xml'
+    #     failTaskOnFailedTests: true # required to fail build when tests fail
+  - job: Build_FA
+    dependsOn:
+      Test_FA
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: ArchiveFiles@2
+      displayName: 'Archive FunctionApp'
+      inputs:
+        rootFolderOrFile: FunctionApp
+        includeRootFolder: false
+        archiveFile: '$(System.DefaultWorkingDirectory)/zip/FunctionApp.zip'
+    - task: PublishPipelineArtifact@0
+      inputs:
+        artifactName: 'zip'
+        targetPath: '$(System.DefaultWorkingDirectory)/zip'
+
+- stage: Deploy
+  condition:
+    and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+  dependsOn:
+    Build
+  jobs:
+  - job: Deploy_ARM
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: AzureResourceGroupDeployment@2
+      displayName: 'Deploy Azure Resources'
+      inputs:
+        azureSubscription: $(AzureConnection)
+        resourceGroupName: $(ResourcegGroupName)
+        location: 'West Europe'
+        csmFile: Deployment/azuredeploy.json
+        csmParametersFile: Deployment/azuredeploy.parameters.json
+        overrideParameters: '-functionAppName $(FunctionAppName)'
+        deploymentMode: Incremental
+        deploymentOutputs: DeploymentOutput
+    - task: AzurePowerShell@5
+      displayName: 'Set FA Permissions'
+      inputs:
+        azureSubscription: $(AzureConnection)
+        ScriptPath: Deployment/deploy.ps1
+        ScriptArguments: '-DeploymentOutput ''$(DeploymentOutput)'''
+        azurePowerShellVersion: LatestVersion
+        pwsh: true
+  - job: Deploy_FA
+    dependsOn:
+      Deploy_ARM
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: DownloadPipelineArtifact@0
+      inputs:
+        artifactName: 'zip'
+        targetPath: '$(System.DefaultWorkingDirectory)/zip'
+    - task: AzureFunctionApp@1
+      displayName: 'Deploy Azure Function'
+      inputs:
+        azureSubscription: $(AzureConnection)
+        appType: functionApp
+        appName: $(FunctionAppName)
+        package: '$(System.DefaultWorkingDirectory)/**/*.zip'
+        deploymentMethod: 'auto'
